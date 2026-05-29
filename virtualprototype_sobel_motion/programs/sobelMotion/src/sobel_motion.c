@@ -11,42 +11,44 @@
 
 /* Set this to 0 when you want to skip the debug screens. */
 #define RUN_DEBUG_TESTS 1
-#define RUN_SOFTWARE_DEBUG_TEST 0
+#define RUN_TEMP_DIFF_SW_TEST 1
 #define RUN_SOFTWARE_BASELINE 0
 #define SW_BASELINE_FRAMES 5
 #define HW_STREAM_FRAMES 60
 #define CAMERA_DEBUG_FRAMES 30
+#define TEMP_DIFF_FRAMES 30
 #define DEBUG_DELAY_LOOPS 20000000u
-#define SHOW_SOFTWARE_SOBEL_VIEW 1
 #define SHOW_SOFTWARE_BASELINE_VIEW 1
 
 /* Sobel threshold presets:
  * Lower = more edges/noise, higher = fewer stronger edges.
  */
 #define SOBEL_THRESHOLD_SW 160
+#define TEMP_DIFF_SOBEL_THRESHOLD 80
+#define TEMP_DIFF_OUTPUT_BINARY 1
 #define SOBEL_THRESHOLD_HW_LOW 40
 #define SOBEL_THRESHOLD_HW_MEDIUM 80
 #define SOBEL_THRESHOLD_HW_HIGH 120
-#define SOBEL_THRESHOLD_HW SOBEL_THRESHOLD_HW_MEDIUM
+#define SOBEL_THRESHOLD_HW SOBEL_THRESHOLD_HW_LOW
 
 /* Motion threshold presets:
  * Lower = more sensitive, higher = fewer false positives.
  */
 #define MOTION_TILE_ACTIVE_THRESHOLD_LOW 3
 #define MOTION_TILE_ACTIVE_THRESHOLD_MEDIUM 4
-#define MOTION_TILE_ACTIVE_THRESHOLD_HIGH 6
+#define MOTION_TILE_ACTIVE_THRESHOLD_HIGH 8
 #define MOTION_ACTIVE_TILES_THRESHOLD_LOW 2
 #define MOTION_ACTIVE_TILES_THRESHOLD_MEDIUM 4
-#define MOTION_ACTIVE_TILES_THRESHOLD_HIGH 8
-#define MOTION_TILE_ACTIVE_THRESHOLD MOTION_TILE_ACTIVE_THRESHOLD_MEDIUM
-#define MOTION_ACTIVE_TILES_THRESHOLD MOTION_ACTIVE_TILES_THRESHOLD_MEDIUM
+#define MOTION_ACTIVE_TILES_THRESHOLD_HIGH 5
+#define MOTION_TILE_ACTIVE_THRESHOLD MOTION_TILE_ACTIVE_THRESHOLD_HIGH
+#define MOTION_ACTIVE_TILES_THRESHOLD MOTION_ACTIVE_TILES_THRESHOLD_HIGH
 
 #define MOTION_TILE_SIZE 16
 #define MOTION_TILE_SAMPLE_STEP 8
 #define MOTION_MAX_TILE_COLUMNS (IMG_W_MAX / MOTION_TILE_SIZE)
 #define MOTION_MAX_TILE_ROWS (IMG_H_MAX / MOTION_TILE_SIZE)
-#define MOTION_SUMMARY_COLUMNS 8
-#define MOTION_SUMMARY_ROWS 8
+#define MOTION_SUMMARY_COLUMNS 16
+#define MOTION_SUMMARY_ROWS 16
 
 typedef struct {
   uint8_t min;
@@ -65,12 +67,30 @@ typedef struct {
   uint32_t motion_detected;
 } motion_stats_t;
 
+typedef struct {
+  uint32_t capture_cycles;
+  uint32_t diff_cycles;
+  uint32_t sobel_cycles;
+  uint32_t total_cycles;
+} profile_accum_t;
+
 volatile uint16_t rgb565[IMG_W_MAX * IMG_H_MAX] __attribute__((aligned(16)));
 volatile uint8_t grayscale[IMG_W_MAX * IMG_H_MAX] __attribute__((aligned(16)));
 volatile uint8_t sobel_sw[IMG_W_MAX * IMG_H_MAX] __attribute__((aligned(16)));
 volatile uint8_t edge_a[IMG_W_MAX * IMG_H_MAX] __attribute__((aligned(16)));
 volatile uint8_t edge_b[IMG_W_MAX * IMG_H_MAX] __attribute__((aligned(16)));
+
+/* The temporal-difference software comparison reuses existing full-frame
+ * buffers to avoid adding another large pair of 640x480 images.
+ *   grayscale_prev aliases grayscale
+ *   tempdiff_edge aliases sobel_sw
+ */
+#define grayscale_prev grayscale
+#define tempdiff_edge sobel_sw
+static uint8_t diff_line[3][IMG_W_MAX] __attribute__((aligned(16)));
+
 static uint8_t active_tile_map[MOTION_MAX_TILE_COLUMNS * MOTION_MAX_TILE_ROWS];
+static uint8_t accumulated_tile_map[MOTION_MAX_TILE_COLUMNS * MOTION_MAX_TILE_ROWS];
 
 static inline void camera_set_output_mode(uint32_t mode) {
   /* camera CI command 8:
@@ -108,6 +128,25 @@ static uint32_t cpu_khz_from_info(uint32_t cpu_info) {
 static void print_cycles(const char *label, uint32_t cycles, uint32_t cpu_khz) {
   uint32_t ms = (cpu_khz == 0) ? 0 : cycles / cpu_khz;
   printf("%s: %d cycles, approx %d ms\n", label, cycles, ms);
+}
+
+static uint32_t average_cycles(uint32_t total_cycles, uint32_t frames) {
+  return (frames == 0) ? 0 : total_cycles / frames;
+}
+
+static void print_average_cycles(const char *label,
+                                 uint32_t total_cycles,
+                                 uint32_t frames,
+                                 uint32_t cpu_khz) {
+  print_cycles(label, average_cycles(total_cycles, frames), cpu_khz);
+}
+
+static void print_fps_from_average(const char *label,
+                                   uint32_t avg_cycles,
+                                   uint32_t cpu_khz) {
+  uint32_t avg_ms = (cpu_khz == 0) ? 0 : avg_cycles / cpu_khz;
+  uint32_t fps = (avg_ms == 0) ? 0 : 1000 / avg_ms;
+  printf("%s: approx %d FPS (%d ms/frame)\n", label, fps, avg_ms);
 }
 
 static void visual_debug_delay(void) {
@@ -209,9 +248,144 @@ static void rgb565_to_grayscale_sw(volatile uint16_t *src,
   }
 }
 
-static void print_active_tile_map(const char *label,
-                                  int32_t width,
-                                  int32_t height) {
+static inline uint8_t rgb565_pixel_to_grayscale_sw(uint16_t stored_rgb565) {
+  uint16_t rgb = swap_u16(stored_rgb565);
+  uint32_t red   = ((rgb >> 11) & 0x1F) << 3;
+  uint32_t green = ((rgb >> 5)  & 0x3F) << 2;
+  uint32_t blue  = (rgb & 0x1F) << 3;
+  return ((red * 54 + green * 183 + blue * 19) >> 8) & 0xFF;
+}
+
+static inline uint8_t abs_diff_u8(uint8_t a, uint8_t b) {
+  return (a > b) ? (a - b) : (b - a);
+}
+
+static inline uint8_t tempdiff_sobel_output(int32_t magnitude) {
+  if (magnitude <= TEMP_DIFF_SOBEL_THRESHOLD) {
+    return 0;
+  }
+#if TEMP_DIFF_OUTPUT_BINARY
+  return 255;
+#else
+  return (magnitude > 255) ? 255 : magnitude;
+#endif
+}
+
+/* Software-only teammate comparison path.
+ *
+ * This performs temporal difference before Sobel, so static background edges
+ * are suppressed and only moving edges remain.  It is useful as an alternative
+ * software reference, but it is intentionally not used as the final hardware
+ * architecture: moving this into camera.v would require previous-frame memory
+ * reads plus updated-frame writes from the camera accelerator.  The final
+ * hardware Sobel path stays purely streaming and write-only, then the CPU uses
+ * motion4_ci() on the resulting edge frames.
+ */
+static void run_temporal_difference_sobel_sw(volatile unsigned int *vga,
+                                             int32_t width,
+                                             int32_t height,
+                                             uint32_t pixels,
+                                             uint32_t cpu_khz) {
+  profile_accum_t profile;
+  uint32_t start;
+  uint32_t frames;
+
+  profile.capture_cycles = 0;
+  profile.diff_cycles = 0;
+  profile.sobel_cycles = 0;
+  profile.total_cycles = 0;
+
+  printf("\nTemporal-difference software Sobel for %d frames...\n", TEMP_DIFF_FRAMES);
+  printf("This is a software comparison path, not the final hardware architecture.\n");
+
+  camera_set_output_mode(0);
+  clear_u8(tempdiff_edge, pixels, 0);
+  vga[2] = swap_u32(2);
+  vga[3] = swap_u32((uint32_t) &tempdiff_edge[0]);
+
+  takeSingleImageBlocking((uint32_t) &rgb565[0]);
+  rgb565_to_grayscale_sw(rgb565, grayscale_prev, width, height);
+
+  for (frames = 0; frames < TEMP_DIFF_FRAMES; frames++) {
+    uint32_t frame_capture_cycles;
+    uint32_t frame_diff_cycles = 0;
+    uint32_t frame_sobel_cycles = 0;
+
+    start = cycle_counter_ci();
+    takeSingleImageBlocking((uint32_t) &rgb565[0]);
+    frame_capture_cycles = cycle_counter_ci() - start;
+
+    for (int32_t x = 0; x < width; x++) {
+      tempdiff_edge[x] = 0;
+      tempdiff_edge[(height - 1) * width + x] = 0;
+    }
+
+    for (int32_t y = 0; y < height; y++) {
+      uint32_t diff_start = cycle_counter_ci();
+      uint8_t *line = diff_line[y % 3];
+
+      for (int32_t x = 0; x < width; x++) {
+        uint32_t index = y * width + x;
+        uint8_t current_gray = rgb565_pixel_to_grayscale_sw(rgb565[index]);
+        uint8_t previous_gray = grayscale_prev[index];
+        line[x] = abs_diff_u8(current_gray, previous_gray);
+        grayscale_prev[index] = current_gray;
+      }
+      frame_diff_cycles += cycle_counter_ci() - diff_start;
+
+      if (y >= 2) {
+        uint32_t sobel_start = cycle_counter_ci();
+        int32_t center_y = y - 1;
+        uint8_t *top = diff_line[(y - 2) % 3];
+        uint8_t *mid = diff_line[(y - 1) % 3];
+        uint8_t *bot = diff_line[y % 3];
+        uint32_t out_base = center_y * width;
+
+        tempdiff_edge[out_base] = 0;
+        for (int32_t x = 1; x < width - 1; x++) {
+          int32_t p00 = top[x - 1];
+          int32_t p01 = top[x];
+          int32_t p02 = top[x + 1];
+          int32_t p10 = mid[x - 1];
+          int32_t p12 = mid[x + 1];
+          int32_t p20 = bot[x - 1];
+          int32_t p21 = bot[x];
+          int32_t p22 = bot[x + 1];
+          int32_t gx = -p00 + p02 - (p10 << 1) + (p12 << 1) - p20 + p22;
+          int32_t gy = -p00 - (p01 << 1) - p02 + p20 + (p21 << 1) + p22;
+          int32_t mag = ((gx < 0) ? -gx : gx) + ((gy < 0) ? -gy : gy);
+          tempdiff_edge[out_base + x] = tempdiff_sobel_output(mag);
+        }
+        tempdiff_edge[out_base + width - 1] = 0;
+        frame_sobel_cycles += cycle_counter_ci() - sobel_start;
+      }
+    }
+
+    profile.capture_cycles += frame_capture_cycles;
+    profile.diff_cycles += frame_diff_cycles;
+    profile.sobel_cycles += frame_sobel_cycles;
+    profile.total_cycles += frame_capture_cycles + frame_diff_cycles + frame_sobel_cycles;
+  }
+
+  uint32_t avg_capture = average_cycles(profile.capture_cycles, frames);
+  uint32_t avg_diff = average_cycles(profile.diff_cycles, frames);
+  uint32_t avg_sobel = average_cycles(profile.sobel_cycles, frames);
+  uint32_t avg_processing = avg_diff + avg_sobel;
+  uint32_t avg_total = avg_capture + avg_processing;
+
+  print_image_stats("temporal-difference Sobel", tempdiff_edge, width, height);
+  print_cycles("tempdiff average capture", avg_capture, cpu_khz);
+  print_cycles("tempdiff average grayscale diff/update", avg_diff, cpu_khz);
+  print_cycles("tempdiff average Sobel-on-diff", avg_sobel, cpu_khz);
+  print_cycles("tempdiff average processing after capture", avg_processing, cpu_khz);
+  print_cycles("tempdiff average total with capture", avg_total, cpu_khz);
+  print_fps_from_average("tempdiff software approximate throughput", avg_total, cpu_khz);
+}
+
+static void print_tile_map_summary(const char *label,
+                                   volatile uint8_t *tile_map,
+                                   int32_t width,
+                                   int32_t height) {
   uint32_t columns = width / MOTION_TILE_SIZE;
   uint32_t rows = height / MOTION_TILE_SIZE;
 
@@ -239,7 +413,7 @@ static void print_active_tile_map(const char *label,
 
       for (uint32_t ty = tile_y0; ty < tile_y1 && active == 0; ty++) {
         for (uint32_t tx = tile_x0; tx < tile_x1; tx++) {
-          if (active_tile_map[ty * columns + tx] != 0) {
+          if (tile_map[ty * columns + tx] != 0) {
             active = 1;
             break;
           }
@@ -247,6 +421,10 @@ static void print_active_tile_map(const char *label,
       }
 
       putchar(active ? 'X' : '.');
+      if (sx + 1 < MOTION_SUMMARY_COLUMNS) {
+        putchar(' ');
+        putchar(' ');
+      }
     }
     putchar('\n');
   }
@@ -338,52 +516,6 @@ static void test_camera_grayscale_mode(volatile unsigned int *vga,
 
   print_image_stats("camera grayscale", grayscale, width, height);
   printf("Camera grayscale debug frames: %d\n", CAMERA_DEBUG_FRAMES);
-}
-
-/* -------------------------------------------------------------------------- */
-/* Debug test 3: software Sobel from a real RGB565 camera frame.               */
-/* Expected result: a CPU-computed edge view from one live camera capture.      */
-/* -------------------------------------------------------------------------- */
-static void test_camera_rgb565_sw_sobel(volatile unsigned int *vga,
-                                        int32_t width,
-                                        int32_t height,
-                                        uint32_t pixels,
-                                        uint32_t cpu_khz) {
-  uint32_t start;
-  uint32_t raw_capture_cycles;
-  uint32_t grayscale_cycles;
-  uint32_t sobel_cycles;
-
-  printf("\nTEST 3: software Sobel from real RGB565 camera frame...\n");
-  show_stable_blank_view(vga, edge_b, pixels);
-
-  camera_set_output_mode(0);
-  start = cycle_counter_ci();
-  takeSingleImageBlocking((uint32_t) &rgb565[0]);
-  raw_capture_cycles = cycle_counter_ci() - start;
-
-  start = cycle_counter_ci();
-  rgb565_to_grayscale_sw(rgb565, grayscale, width, height);
-  grayscale_cycles = cycle_counter_ci() - start;
-
-  clear_u8(sobel_sw, pixels, 0);
-
-  start = cycle_counter_ci();
-  edgeDetection(grayscale, sobel_sw, width, height, SOBEL_THRESHOLD_SW);
-  sobel_cycles = cycle_counter_ci() - start;
-
-  print_image_stats("sw grayscale from RGB565", grayscale, width, height);
-  print_image_stats("sw sobel from RGB565", sobel_sw, width, height);
-  print_cycles("raw RGB565 capture", raw_capture_cycles, cpu_khz);
-  print_cycles("software RGB565->gray", grayscale_cycles, cpu_khz);
-  print_cycles("software Sobel only", sobel_cycles, cpu_khz);
-  print_cycles("software total after capture", grayscale_cycles + sobel_cycles, cpu_khz);
-
-  if (SHOW_SOFTWARE_SOBEL_VIEW) {
-    vga[2] = swap_u32(2);
-    vga[3] = swap_u32((uint32_t) &sobel_sw[0]);
-    visual_debug_delay();
-  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -496,7 +628,8 @@ static void test_camera_motion4_real_frames(volatile unsigned int *vga,
 }
 
 static void run_debug_tests(volatile unsigned int *vga,
-                            camParameters camParams,
+                            int32_t width,
+                            int32_t height,
                             uint32_t pixels,
                             uint32_t cpu_khz) {
   printf("\n================ DEBUG TESTS START ================\n");
@@ -504,29 +637,25 @@ static void run_debug_tests(volatile unsigned int *vga,
 
   test_raw_camera_rgb565(vga);
 
-  test_camera_grayscale_mode(vga,
-                             camParams.nrOfPixelsPerLine,
-                             camParams.nrOfLinesPerImage);
+  test_camera_grayscale_mode(vga, width, height);
 
-#if RUN_SOFTWARE_DEBUG_TEST
-  test_camera_rgb565_sw_sobel(vga,
-                              camParams.nrOfPixelsPerLine,
-                              camParams.nrOfLinesPerImage,
-                              pixels,
-                              cpu_khz);
+#if RUN_TEMP_DIFF_SW_TEST
+  printf("\nTEST 3: temporal-difference software Sobel comparison.\n");
+  run_temporal_difference_sobel_sw(vga,
+                                   width,
+                                   height,
+                                   pixels,
+                                   cpu_khz);
 #else
-  printf("\nTEST 3: software Sobel timing skipped. Set RUN_SOFTWARE_DEBUG_TEST=1 to enable.\n");
+  printf("\nTEST 3: temporal-difference software Sobel skipped. Set RUN_TEMP_DIFF_SW_TEST=1 to enable.\n");
 #endif
 
-  test_camera_sobel_mode_only(vga,
-                              camParams.nrOfPixelsPerLine,
-                              camParams.nrOfLinesPerImage,
-                              cpu_khz);
+  test_camera_sobel_mode_only(vga, width, height, cpu_khz);
 
   test_camera_motion4_real_frames(vga,
                                   pixels,
-                                  camParams.nrOfPixelsPerLine,
-                                  camParams.nrOfLinesPerImage,
+                                  width,
+                                  height,
                                   cpu_khz);
 
   printf("\n================ DEBUG TESTS END ==================\n");
@@ -559,10 +688,13 @@ int main(void) {
   printf("CPU info   : 0x%08x\n", cpu_info);
   printf("CPU (kHz)  : %d\n", cpu_khz);
 
-  uint32_t pixels = camParams.nrOfPixelsPerLine * camParams.nrOfLinesPerImage;
+  int32_t width = camParams.nrOfPixelsPerLine;
+  int32_t height = camParams.nrOfLinesPerImage;
+  uint32_t pixels = width * height;
+  printf("Image size : %d x %d (%d pixels)\n", width, height, pixels);
 
 #if RUN_DEBUG_TESTS
-  run_debug_tests(vga, camParams, pixels, cpu_khz);
+  run_debug_tests(vga, width, height, pixels, cpu_khz);
 #endif
 
   /* ---------------------------------------------------------------------- */
@@ -574,19 +706,36 @@ int main(void) {
   show_stable_blank_view(vga, edge_b, pixels);
 
   uint32_t sw_frames = 0;
-  for (sw_frames = 0; sw_frames < SW_BASELINE_FRAMES; sw_frames++) {
-    takeSingleImageBlocking((uint32_t) &rgb565[0]);
+  profile_accum_t sw_profile;
+  sw_profile.capture_cycles = 0;
+  sw_profile.diff_cycles = 0;
+  sw_profile.sobel_cycles = 0;
+  sw_profile.total_cycles = 0;
 
-    rgb565_to_grayscale_sw(rgb565, grayscale,
-                           camParams.nrOfPixelsPerLine,
-                           camParams.nrOfLinesPerImage);
+  for (sw_frames = 0; sw_frames < SW_BASELINE_FRAMES; sw_frames++) {
+    uint32_t start;
+    uint32_t capture_cycles;
+    uint32_t grayscale_cycles;
+    uint32_t sobel_cycles;
+
+    start = cycle_counter_ci();
+    takeSingleImageBlocking((uint32_t) &rgb565[0]);
+    capture_cycles = cycle_counter_ci() - start;
+
+    start = cycle_counter_ci();
+    rgb565_to_grayscale_sw(rgb565, grayscale, width, height);
+    grayscale_cycles = cycle_counter_ci() - start;
 
     clear_u8(sobel_sw, pixels, 0);
 
-    edgeDetection(grayscale, sobel_sw,
-                  camParams.nrOfPixelsPerLine,
-                  camParams.nrOfLinesPerImage,
-                  SOBEL_THRESHOLD_SW);
+    start = cycle_counter_ci();
+    edgeDetection(grayscale, sobel_sw, width, height, SOBEL_THRESHOLD_SW);
+    sobel_cycles = cycle_counter_ci() - start;
+
+    sw_profile.capture_cycles += capture_cycles;
+    sw_profile.diff_cycles += grayscale_cycles;
+    sw_profile.sobel_cycles += sobel_cycles;
+    sw_profile.total_cycles += capture_cycles + grayscale_cycles + sobel_cycles;
 
     if (SHOW_SOFTWARE_BASELINE_VIEW) {
       vga[2] = swap_u32(2);
@@ -596,6 +745,17 @@ int main(void) {
 
   printf("Software Sobel frames completed: %d\n", sw_frames);
   printf("This is the non-real-time reference path required by the project.\n");
+  uint32_t sw_avg_capture = average_cycles(sw_profile.capture_cycles, sw_frames);
+  uint32_t sw_avg_gray = average_cycles(sw_profile.diff_cycles, sw_frames);
+  uint32_t sw_avg_sobel = average_cycles(sw_profile.sobel_cycles, sw_frames);
+  uint32_t sw_avg_processing = sw_avg_gray + sw_avg_sobel;
+  uint32_t sw_avg_total = sw_avg_capture + sw_avg_processing;
+  print_cycles("software baseline average capture", sw_avg_capture, cpu_khz);
+  print_cycles("software baseline average grayscale", sw_avg_gray, cpu_khz);
+  print_cycles("software baseline average Sobel", sw_avg_sobel, cpu_khz);
+  print_cycles("software baseline average processing after capture", sw_avg_processing, cpu_khz);
+  print_cycles("software baseline average total with capture", sw_avg_total, cpu_khz);
+  print_fps_from_average("software baseline approximate throughput", sw_avg_total, cpu_khz);
 #else
   printf("\nSoftware-only Sobel baseline skipped. Set RUN_SOFTWARE_BASELINE=1 to enable.\n");
 #endif
@@ -612,6 +772,9 @@ int main(void) {
 
   clear_u8(edge_a, pixels, 0);
   clear_u8(edge_b, pixels, 0);
+  clear_u8(accumulated_tile_map,
+           MOTION_MAX_TILE_COLUMNS * MOTION_MAX_TILE_ROWS,
+           0);
 
   /* Prime the previous frame. */
   takeSingleImageBlocking((uint32_t) &edge_a[0]);
@@ -623,22 +786,30 @@ int main(void) {
   uint32_t last_motion_detected = 0;
   uint32_t total_changed_samples = 0;
   uint32_t total_active_tiles = 0;
+  uint32_t total_hw_capture_cycles = 0;
+  uint32_t total_hw_compare_cycles = 0;
   uint32_t use_a_as_current = 0;
 
   for (hw_frames = 0; hw_frames < HW_STREAM_FRAMES; hw_frames++) {
     volatile uint8_t *current = use_a_as_current ? edge_a : edge_b;
     volatile uint8_t *previous = use_a_as_current ? edge_b : edge_a;
 
+    uint32_t start = cycle_counter_ci();
     takeSingleImageBlocking((uint32_t) current);
-    motion = motion16_tiles_frame(current,
-                                  previous,
-                                  camParams.nrOfPixelsPerLine,
-                                  camParams.nrOfLinesPerImage);
+    total_hw_capture_cycles += cycle_counter_ci() - start;
+
+    start = cycle_counter_ci();
+    motion = motion16_tiles_frame(current, previous, width, height);
+    total_hw_compare_cycles += cycle_counter_ci() - start;
+
     last_changed_samples = motion.changed_samples;
     last_active_tiles = motion.active_tiles;
     last_motion_detected = motion.motion_detected;
     total_changed_samples += last_changed_samples;
     total_active_tiles += last_active_tiles;
+    for (uint32_t i = 0; i < MOTION_MAX_TILE_COLUMNS * MOTION_MAX_TILE_ROWS; i++) {
+      accumulated_tile_map[i] |= active_tile_map[i];
+    }
     vga[3] = swap_u32((uint32_t) current);
 
     if (((hw_frames + 1) % MOTION_PRINT_EVERY) == 0) {
@@ -659,9 +830,14 @@ int main(void) {
   printf("Average tile motion: samples=%d active tiles=%d/frame\n",
          (hw_frames == 0) ? 0 : total_changed_samples / hw_frames,
          (hw_frames == 0) ? 0 : total_active_tiles / hw_frames);
-  print_active_tile_map("Final frame",
-                        camParams.nrOfPixelsPerLine,
-                        camParams.nrOfLinesPerImage);
+  uint32_t hw_avg_capture = average_cycles(total_hw_capture_cycles, hw_frames);
+  uint32_t hw_avg_compare = average_cycles(total_hw_compare_cycles, hw_frames);
+  uint32_t hw_avg_total = hw_avg_capture + hw_avg_compare;
+  print_cycles("final hardware average capture", hw_avg_capture, cpu_khz);
+  print_cycles("final motion4 tile average compare", hw_avg_compare, cpu_khz);
+  print_cycles("final hardware+motion average total", hw_avg_total, cpu_khz);
+  print_fps_from_average("final hardware+motion approximate throughput", hw_avg_total, cpu_khz);
+  print_tile_map_summary("Accumulated run", accumulated_tile_map, width, height);
 
   while (1) {
     /* Keep the final Sobel/motion image on screen. */
